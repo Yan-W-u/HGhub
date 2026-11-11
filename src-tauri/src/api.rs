@@ -60,10 +60,17 @@ pub async fn line_state() -> Result<Value, String> {
 }
 
 /// 手动切换线路：立即生效并落盘（下次启动沿用）。
+///
+/// 镜像线路通常只是 301 跳板，先跟到最终 origin 再保存，否则加密请求会停在 301 上。
 #[tauri::command]
 pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, String> {
     let previous = base();
-    let next = crate::net::set_base(&url)?;
+    let mut next = crate::net::set_base(&url)?;
+    if let Ok(resolved) = crate::net::resolve_origin(&next).await {
+        if resolved != next {
+            next = crate::net::set_base(&resolved)?;
+        }
+    }
     if previous != next {
         state.session.clear();
     }
@@ -78,11 +85,29 @@ pub async fn line_mirrors() -> Result<Value, String> {
     crate::lines::mirrors().await
 }
 
-/// 可达性探测：只报结果，不做自动检查 / 自动切换。
+/// 可达性探测：只报结果，不做自动切换。
+///
+/// 跳板线路会把 301 当成「能打开」，这里同时把最终 origin 报出来，
+/// 用户在「线路」面板里能直接看到该切到哪。
 #[tauri::command]
 pub async fn line_probe(urls: Vec<String>) -> Result<Value, String> {
     crate::net::refresh_client();
-    Ok(crate::lines::probe(urls).await)
+    let mut rows = crate::lines::probe(urls.clone()).await;
+    if let Some(list) = rows.as_array_mut() {
+        for row in list.iter_mut() {
+            let ok = row.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            let url = row.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            if !ok || url.is_empty() {
+                continue;
+            }
+            if let Ok(final_origin) = crate::net::resolve_origin(&url).await {
+                if final_origin != url {
+                    row["redirect_to"] = json!(final_origin);
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /* ───────────────────────── 更新检查 ───────────────────────── */
@@ -355,11 +380,128 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
     state.get(&format!("/api/videos/{id}")).await
 }
 
+/// 取播放地址。
+///
+/// 站点把真实播放地址从 `GET /api/videos/:id/play`（只剩集数元数据）挪到了
+/// `POST /api/videos/:id/episodes/:ep/playback`，响应里 `streams.main` 才是 m3u8。
+/// 这里优先走新接口，失败**或拿不到地址**时回退旧接口，保证老线路仍能出画面。
 #[tauri::command]
-pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
+pub async fn api_play(
+    app: tauri::AppHandle,
+    state: State<'_, Api>,
+    id: i64,
+    ep: u32,
+) -> Result<Value, String> {
+    let origin = base();
+    let token = state.session.token(&origin);
+
+    // 新接口：成功但 `streams.main` 为空也算失败——那是「接口通了、这集没排片」，
+    // 直接返回空地址会让前端弹「暂无播放地址」，而旧接口往往还能给出地址。
+    let first = match edge(
+        &origin,
+        "POST",
+        &format!("/api/videos/{id}/episodes/{ep}/playback"),
+        None,
+        token.as_deref(),
+    )
+    .await
+    {
+        Ok(v) => {
+            let normalized = normalize_play(v, id, ep);
+            if has_play_url(&normalized) {
+                return Ok(normalized);
+            }
+            format!("新接口无地址: {}", preview(&normalized))
+        }
+        Err(e) => format!("新接口失败: {e}"),
+    };
+
+    match state
         .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
         .await
+    {
+        Ok(v) => {
+            let normalized = normalize_play(v, id, ep);
+            if has_play_url(&normalized) {
+                Ok(normalized)
+            } else {
+                // 两个接口都没地址：把两条线索都落盘，否则真机上只能看到
+                // 前端那句「暂无播放地址」，没法定位到底是哪一层出的问题。
+                log_play_failure(&app, &origin, id, ep, &format!("{first} | 旧接口无地址: {}", preview(&normalized)));
+                Err("暂无播放地址".into())
+            }
+        }
+        Err(e) => {
+            log_play_failure(&app, &origin, id, ep, &format!("{first} | 旧接口失败: {e}"));
+            Err(first)
+        }
+    }
+}
+
+/// 取一段可读的响应片段，用于日志（不含 token）。
+fn preview(value: &Value) -> String {
+    let text = value.to_string();
+    text.chars().take(200).collect()
+}
+
+/// 播放失败时写一行到 debug.log。诊断用途，写不进去也不能影响主流程。
+fn log_play_failure(app: &tauri::AppHandle, origin: &str, id: i64, ep: u32, detail: &str) {
+    use tauri::Manager;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let line = format!("[play] id={id} ep={ep} origin={origin} → {detail}");
+    let _ = crate::logging::append_debug(&dir, &line);
+}
+
+/// 结果里是否真的带了可直接播放的地址。
+fn has_play_url(value: &Value) -> bool {
+    ["video_url", "video_url_hevc"]
+        .iter()
+        .any(|k| value.get(*k).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()))
+}
+
+/// 把 `{streams:{main,...}, cdn:{authKey,authValue}}` 摊平成前端一直用的字段。
+///
+/// 前端读的是 `video_url` / `video_url_hevc` / `ep_num` / `duration`，新接口给的是
+/// `streams.main` / `streams.hevc` / `ep`，两种形状都要能喂给播放器。
+fn normalize_play(mut value: Value, id: i64, ep: u32) -> Value {
+    if !value.is_object() {
+        return value;
+    }
+    let streams = value.get("streams").cloned();
+    let main = streams
+        .as_ref()
+        .and_then(|s| s.get("main"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let hevc = streams
+        .as_ref()
+        .and_then(|s| s.get("hevc"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let empty = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true)
+    };
+    if empty(&value, "video_url") && !main.is_empty() {
+        value["video_url"] = json!(main);
+    }
+    if empty(&value, "video_url_hevc") && !hevc.is_empty() {
+        value["video_url_hevc"] = json!(hevc);
+    }
+    if value.get("ep_num").is_none() {
+        value["ep_num"] = value.get("ep").cloned().unwrap_or(json!(ep));
+    }
+    if value.get("id").is_none() {
+        value["id"] = json!(id);
+    }
+    value
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */

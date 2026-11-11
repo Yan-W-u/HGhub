@@ -234,10 +234,10 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="text-[12px] text-on/85">github.com/Minireel/HGhub</span>
               <span className="ml-auto text-[10.5px] text-primary">复制</span>
             </button>
-            <button onClick={() => { navigator.clipboard?.writeText("https://huangguoai.com").then(() => toast("站点地址已复制", "ok")).catch(() => {}); }}
+            <button onClick={() => { navigator.clipboard?.writeText("https://huangguoai.io").then(() => toast("站点地址已复制", "ok")).catch(() => {}); }}
               className="w-full flex items-center gap-2 py-2.5 text-left pressable">
               <ILink size={15} className="text-mut" />
-              <span className="text-[12px] text-on/85">huangguoai.com</span>
+              <span className="text-[12px] text-on/85">huangguoai.io</span>
               <span className="ml-auto text-[10.5px] text-primary">复制</span>
             </button>
             <div className="flex items-center gap-2 py-2.5">

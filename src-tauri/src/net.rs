@@ -20,8 +20,6 @@
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
 use crate::network_policy;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -30,8 +28,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// 默认上游（固定线路 1）。
-pub const DEFAULT_BASE: &str = "https://huangguoai.com";
+/// 默认上游。`huangguoai.com` 在 2026-11 已停止提供加密接口（TCP 443 超时），
+/// 官方页面当前挂在 `huangguoai.io`，因此默认线路跟着改。
+pub const DEFAULT_BASE: &str = "https://huangguoai.io";
 
 /// 当前上游基址（不带结尾斜杠）。可在设置里切到固定线路 2 或镜像线路，运行时立即生效。
 static BASE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(DEFAULT_BASE.to_string()));
@@ -59,8 +58,12 @@ pub fn normalize_base(raw: &str) -> Option<String> {
 }
 
 /// 远端发布页只提供游客镜像，不能扩展账号密码的信任范围。
+/// `huangguoai.io` 是站点当前的官方域名（页面标题「黄果短剧官网」），与 `.com`/`.ai` 同级。
 pub fn trusted_auth_origin(origin: &str) -> bool {
-    matches!(origin, "https://huangguoai.com" | "https://huangguoai.ai")
+    matches!(
+        origin,
+        "https://huangguoai.com" | "https://huangguoai.ai" | "https://huangguoai.io"
+    )
 }
 
 /// 启动时读回上次选择的线路（文件不存在 / 内容坏了就保持默认）。
@@ -451,7 +454,11 @@ fn edge_operation(path: &str) -> &'static str {
     }
 }
 
-/// 仅无请求体、无凭据的逻辑 GET 可以迁移网关；信封本身仍使用 POST。
+/// 仅无请求体、无凭据的逻辑 GET 可以迁移网关。
+///
+/// 加密通道的帧本身带 `sid`/`seq`，跨网关重放会直接判定为会话不匹配，
+/// 所以 `edge()` 不再跟随业务重定向；这里保留规则供测试与后续排查使用。
+#[allow(dead_code)]
 fn edge_redirect_target(
     current: &url::Url,
     status: u16,
@@ -464,7 +471,80 @@ fn edge_redirect_target(
     network_policy::redirect_target(current, location)
 }
 
-/// 业务请求：走边缘信封。
+/// 只取响应头，用于线路探测。目标检查与 DNS 固定和 [`get`] 一致。
+pub async fn head(raw: &str, timeout: Duration) -> Result<u16, String> {
+    tokio::time::timeout(timeout, async {
+        let mut next = network_policy::parse_target(raw)?;
+        for hop in 0..=5 {
+            let (target, client) = client_for(next.as_str()).await?;
+            let response = client
+                .head(target.clone())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|e| err_text(&e))?;
+            let status = response.status().as_u16();
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                return Ok(status);
+            }
+            if hop == 5 {
+                return Err("重定向次数超过限制".into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .ok_or("重定向缺少有效 Location")?;
+            next = network_policy::redirect_target(&target, location)?;
+        }
+        Err("重定向次数超过限制".into())
+    })
+    .await
+    .map_err(|_| "请求超时".to_string())?
+}
+
+/// 把线路 origin 落到「真正提供服务的那台主机」。
+///
+/// 镜像线路（`thu.gitiecgad.cc` 之类）现在只是 301 跳板，全部跳到一个当日域名
+/// （`00b4b.adihsppe.cc`）。客户端的加密请求固定走 `redirect: none`，一旦线路
+/// 是跳板就会停在 301 上，表现为「线路能打开但内容全空」。所以先用一次 GET 把
+/// 跳转跟到底，取最终 origin，并把线路切过去。
+pub async fn resolve_origin(origin: &str) -> Result<String, String> {
+    let start = normalize_base(origin).ok_or("线路地址无效")?;
+    let mut next = url::Url::parse(&start).map_err(|_| "线路地址无效".to_string())?;
+    for _ in 0..=3 {
+        let (target, client) = client_for(next.as_str()).await?;
+        let resp = client
+            .get(target.clone())
+            .timeout(Duration::from_secs(12))
+            .header("Accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .map_err(|e| err_text(&e))?;
+        let status = resp.status().as_u16();
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let final_origin = normalize_base(target.as_str())
+                .ok_or("线路地址无效".to_string())?;
+            if final_origin != start {
+                let _ = set_base(&final_origin);
+            }
+            return Ok(final_origin);
+        }
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or("线路跳转缺少 Location")?;
+        next = network_policy::redirect_target(&target, location)?;
+    }
+    Err("线路跳转次数超过限制".into())
+}
+
+/// 业务请求：走 `dx150-edge-v1` 加密通道。
+///
+/// 站点在 2026-11 把 `/api/edge/request` 明文信封下线，改成四个加密入口
+/// `/api/{public,user,playback,dynamic}/request`。握手、密钥派生与帧格式见
+/// [`crate::edge_crypto`]；老客户端仍在发明文信封，所以列表与详情全都拿不到。
 pub async fn edge(
     origin: &str,
     method: &str,
@@ -473,123 +553,143 @@ pub async fn edge(
     token: Option<&str>,
 ) -> Result<Value, String> {
     let cur = normalize_base(origin).ok_or("业务请求必须使用安全 HTTPS 线路")?;
+    let plain_path = path.split('?').next().unwrap_or("");
     if network_policy::strict_security()
         && (token.is_some()
             || matches!(
-                path,
+                plain_path,
                 "/api/account/loginByPassword" | "/api/account/registerByPassword"
             ))
         && !trusted_auth_origin(&cur)
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
     }
-    let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
-        None => (String::new(), ""),
-    };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
 
-    let url = format!("{cur}/api/edge/request");
-    let referer = format!("{cur}/");
+    let method_upper = method.trim().to_ascii_uppercase();
+    let scope = crate::edge_crypto::scope_for(&method_upper, path);
+    let body_bytes = match &body {
+        Some(v) => serde_json::to_vec(v).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let content_type = if body.is_some() { "application/json" } else { "" };
     let token = token.map(|s| s.to_string());
+    let can_retry = method_upper == "GET" && body.is_none();
+    let session_key = format!("{cur}|{scope}");
 
     static NEXT_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_EDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let line_host = url::Url::parse(&cur)
-        .unwrap()
-        .host_str()
-        .unwrap()
-        .to_string();
     let operation = edge_operation(path);
+    let line_host = url::Url::parse(&cur).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
     let mut attempt = 0;
-    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
-    let can_retry = method.eq_ignore_ascii_case("GET") && body.is_none();
+
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
-        let envelope = envelope.clone();
+        let cur = cur.clone();
+        let method_upper = method_upper.clone();
+        let path = path.to_string();
+        let body_bytes = body_bytes.clone();
         let token = token.clone();
-        let url = url.clone();
-        let referer = referer.clone();
+        let session_key = session_key.clone();
         let line_host = line_host.clone();
         async move {
             let started = Instant::now();
-            crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
             let mut status_code = None;
-            let mut headers_ms = None;
-            let mut target_host = line_host.clone();
-            let mut response_kind = "unknown";
-            let mut gateway = "other";
+            let mut business_status = None;
             let result = async {
-                let mut next = network_policy::parse_target(&url)?;
-                for hop in 0..=5 {
-                    let (target, client) = client_for(next.as_str()).await?;
-                    target_host = target.host_str().unwrap_or("").to_string();
-                    let mut req = client
-                        .post(target.clone())
-                        .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
-                    if let Some(t) = token.as_deref() {
-                        if !t.is_empty() {
-                            req = req.header("Authorization", format!("Bearer {t}"));
+                let mut round = 0;
+                loop {
+                    round += 1;
+                    let session = match cached_session(&session_key) {
+                        Some(s) => s,
+                        None => {
+                            let fresh = open_session(&cur, scope).await?;
+                            store_session(session_key.clone(), fresh.clone());
+                            fresh
+                        }
+                    };
+                    let (kid, sid, seq, ts, ciphertext) = {
+                        let mut guard = session.lock().map_err(|_| "加密会话锁失败".to_string())?;
+                        let (seq, ts, ciphertext) = guard.seal(
+                            &method_upper,
+                            &path,
+                            &body_bytes,
+                            content_type,
+                            token.as_deref(),
+                        )?;
+                        (guard.kid.clone(), guard.sid.clone(), seq, ts, ciphertext)
+                    };
+                    let frame = json!({
+                        "v": 1,
+                        "type": "call",
+                        "kid": kid,
+                        "sid": sid,
+                        "seq": seq,
+                        "ts": ts,
+                        "ciphertext": ciphertext,
+                    });
+                    let url = format!("{cur}/api/{scope}/request");
+                    let posted = post_frame(&url, &frame, Duration::from_secs(25)).await;
+                    let response = match posted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // 会话过期会以 400/`session_expired` 出现，重开一次再放弃。
+                            drop_session(&session_key);
+                            if round < 2 && (e.contains("400") || e.contains("超时")) {
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let opened = {
+                        let guard = session.lock().map_err(|_| "加密会话锁失败".to_string())?;
+                        guard.open(&response, seq, ts)
+                    };
+                    match opened {
+                        Ok(inner) => {
+                            status_code = inner.get("status").and_then(Value::as_u64);
+                            let text = crate::edge_crypto::Session::body_of(&inner)?;
+                            if text.trim().is_empty() {
+                                return Ok(Value::Null);
+                            }
+                            let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+                                format!("业务响应不是 JSON: {}", text.chars().take(160).collect::<String>())
+                            })?;
+                            business_status = parsed.get("status").and_then(Value::as_i64);
+                            if let Some(code) = status_code {
+                                if code == 401 || code == 403 {
+                                    return Err("401".to_string());
+                                }
+                                if !(200..=299).contains(&code) {
+                                    return Err(format!(
+                                        "HTTP {code}: {}",
+                                        text.chars().take(160).collect::<String>()
+                                    ));
+                                }
+                            }
+                            return Ok(parsed);
+                        }
+                        Err(e) => {
+                            drop_session(&session_key);
+                            if round < 2 {
+                                continue;
+                            }
+                            return Err(e);
                         }
                     }
-                    let resp = req.send().await.map_err(|e| err_text(&e))?;
-                    let status = resp.status();
-                    status_code = Some(status.as_u16());
-                    headers_ms = Some(started.elapsed().as_millis() as u64);
-                    let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-                    response_kind = if ctype.contains("json") { "json" } else if ctype.contains("html") { "html" } else { "other" };
-                    gateway = if resp.headers().contains_key("x-amz-cf-id") { "cloudfront" } else if resp.headers().contains_key("cf-ray") { "cloudflare" } else { "other" };
-                    // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
-                    if status.is_redirection() {
-                        if hop == 5 {
-                            return Err("重定向次数超过限制".into());
-                        }
-                        let location = resp
-                            .headers()
-                            .get(reqwest::header::LOCATION)
-                            .and_then(|h| h.to_str().ok())
-                            .ok_or("重定向缺少有效 Location")?;
-                        next = edge_redirect_target(&target, status.as_u16(), location, guest_get)?;
-                        continue;
-                    }
-                    let text = resp.text().await.map_err(|e| err_text(&e))?;
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        return Err("401".to_string());
-                    }
-                    if !status.is_success() {
-                        return Err(format!(
-                            "HTTP {status}: {}",
-                            text.chars().take(160).collect::<String>()
-                        ));
-                    }
-                    if text.trim().is_empty() {
-                        return Ok(Value::Null);
-                    }
-                    return serde_json::from_str::<Value>(&text)
-                        .map_err(|e| format!("{e}: {}", text.chars().take(160).collect::<String>()));
                 }
-                Err("重定向次数超过限制".into())
-            }.await;
-            crate::playback_log::record("api.end", json!({
-                "request": request, "attempt": attempt, "operation": operation, "method": method,
-                "line_host": line_host, "target_host": target_host, "status": status_code,
-                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
-                "response_kind": response_kind, "gateway": gateway,
-                "business_status": result.as_ref().ok().and_then(|v: &Value| v.get("status")).and_then(Value::as_i64),
-                "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
-                "retryable": can_retry && result.as_ref().err().is_some_and(|e| retryable_error(e)),
-            }));
+            }
+            .await;
+            crate::playback_log::record(
+                "api.end",
+                json!({
+                    "request": request, "attempt": attempt, "operation": operation,
+                    "method": method_upper, "line_host": line_host,
+                    "status": status_code, "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "business_status": business_status,
+                    "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
+                }),
+            );
             result
         }
     })
@@ -598,7 +698,6 @@ pub async fn edge(
     if value.is_null() {
         return Ok(Value::Null);
     }
-
     if value.get("status").and_then(|v| v.as_i64()) == Some(1) {
         Ok(value.get("data").cloned().unwrap_or(Value::Null))
     } else {
@@ -609,6 +708,73 @@ pub async fn edge(
             .unwrap_or("接口返回失败")
             .to_string())
     }
+}
+
+type SharedSession = Arc<Mutex<crate::edge_crypto::Session>>;
+static SESSIONS: Lazy<Mutex<HashMap<String, SharedSession>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn cached_session(key: &str) -> Option<SharedSession> {
+    let map = SESSIONS.lock().ok()?;
+    map.get(key)
+        .filter(|session| session.lock().map(|s| s.usable()).unwrap_or(false))
+        .cloned()
+}
+
+fn store_session(key: String, session: SharedSession) {
+    if let Ok(mut map) = SESSIONS.lock() {
+        if map.len() >= 16 {
+            map.clear();
+        }
+        map.insert(key, session);
+    }
+}
+
+fn drop_session(key: &str) {
+    if let Ok(mut map) = SESSIONS.lock() {
+        map.remove(key);
+    }
+}
+
+/// 握手：拿服务端公钥，派生本次会话的请求/响应密钥。
+async fn open_session(cur: &str, scope: &str) -> Result<SharedSession, String> {
+    let secret = crate::edge_crypto::new_secret();
+    let client_pub = crate::edge_crypto::public_of(&secret);
+    let payload = json!({ "v": 1, "type": "hello", "client_pub": client_pub });
+    let url = format!("{cur}/api/{scope}/request");
+    let value = post_frame(&url, &payload, Duration::from_secs(25)).await?;
+    let session = crate::edge_crypto::Session::establish(scope, &secret, &value)?;
+    Ok(Arc::new(Mutex::new(session)))
+}
+
+/// 把一帧 JSON 发到加密入口。目标检查、DNS 固定与代理沿用 [`client_for`]。
+async fn post_frame(url: &str, payload: &Value, timeout: Duration) -> Result<Value, String> {
+    tokio::time::timeout(timeout, async {
+        let (target, client) = client_for(url).await?;
+        let resp = client
+            .post(target.clone())
+            .header("Accept", "application/json")
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| err_text(&e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| err_text(&e))?;
+        if !status.is_success() {
+            return Err(format!(
+                "HTTP {status}: {}",
+                text.chars().take(160).collect::<String>()
+            ));
+        }
+        serde_json::from_str::<Value>(&text).map_err(|_| {
+            format!(
+                "响应不是 JSON: {}",
+                text.chars().take(160).collect::<String>()
+            )
+        })
+    })
+    .await
+    .map_err(|_| "请求超时".to_string())?
 }
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
@@ -805,23 +971,29 @@ mod tests {
     #[test]
     fn base_requires_https_origin_and_auth_trust_is_static() {
         assert_eq!(
-            normalize_base("https://HUANGGUOAI.COM:443/"),
+            normalize_base("https://HUANGGUOAI.IO:443/"),
             Some(DEFAULT_BASE.into())
         );
+        assert_eq!(
+            normalize_base("https://huangguoai.com/"),
+            Some("https://huangguoai.com".into())
+        );
         for raw in [
-            "http://huangguoai.com",
-            "https://user:pass@huangguoai.com",
-            "https://huangguoai.com/path",
-            "https://huangguoai.com/?secret=1",
-            "https://huangguoai.com/#fragment",
+            "http://huangguoai.io",
+            "https://user:pass@huangguoai.io",
+            "https://huangguoai.io/path",
+            "https://huangguoai.io/?secret=1",
+            "https://huangguoai.io/#fragment",
             "https://192.168.1.1",
         ] {
             assert_eq!(normalize_base(raw), None, "{raw}");
         }
         assert!(trusted_auth_origin(DEFAULT_BASE));
         assert!(trusted_auth_origin("https://huangguoai.ai"));
+        assert!(trusted_auth_origin("https://huangguoai.com"));
         assert!(!trusted_auth_origin("https://mirror.example"));
         assert!(!trusted_auth_origin("https://huangguoai.com.evil.example"));
+        assert!(!trusted_auth_origin("https://huangguoai.io.evil.example"));
     }
 
     #[tokio::test]
@@ -857,6 +1029,37 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("禁止访问"));
+    }
+
+    /// 手跑：`cargo test --lib -- --ignored net::tests::edge_live -- --nocapture`
+    /// 真连上游，验证握手 + 加密帧 + 业务 JSON 整条链路。
+    #[tokio::test]
+    #[ignore = "联网测试：请求上游加密接口，手动用 --ignored 运行"]
+    async fn edge_live() {
+        let base = DEFAULT_BASE.to_string();
+        let feed = edge(&base, "GET", "/api/videos?page=1&size=2", None, None)
+            .await
+            .expect("feed");
+        let items = feed["items"].as_array().expect("items");
+        assert!(!items.is_empty(), "feed empty: {feed}");
+        let id = items[0]["id"].as_i64().expect("id");
+
+        let detail = edge(&base, "GET", &format!("/api/videos/{id}"), None, None)
+            .await
+            .expect("detail");
+        assert_eq!(detail["id"].as_i64(), Some(id));
+
+        let play = edge(
+            &base,
+            "POST",
+            &format!("/api/videos/{id}/episodes/1/playback"),
+            None,
+            None,
+        )
+        .await
+        .expect("playback");
+        let stream = play["streams"]["main"].as_str().unwrap_or("");
+        assert!(stream.starts_with("https://"), "no stream: {play}");
     }
 
     /// 手动跑：`cargo test --lib -- --ignored net::tests::diag -- --nocapture`

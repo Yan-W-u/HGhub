@@ -34,7 +34,7 @@ const stripHtml = (s: string) => s.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, "
 
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
   const store = useStore();
-  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
+  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, history } = store;
   const isDesktop = !isMobile;
 
   const boxRef = useRef<HTMLDivElement>(null);
@@ -171,7 +171,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 分享：复制播放链接 */
   const shareLink = () => {
-    const u = kind === "post" ? (posts[curId]?.video_url || meta.title) : `https://huangguoai.com/video/${curId}/`;
+    const u = kind === "post" ? (posts[curId]?.video_url || meta.title) : `https://huangguoai.io/video/${curId}/`;
     navigator.clipboard?.writeText(u).then(() => toast("链接已复制", "ok")).catch(() => {});
   };
 
@@ -221,6 +221,65 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index, videoIds]);
+
+  /**
+   * 滑到某一条时，自动回到上次看到的位置。
+   *
+   * 之前只有从「观看历史」点进来才带 `startEp/startTime`，从首页点开就是第 1 集从头播。
+   * 现在改成按条目判断：只要这条有观看记录，就恢复集数与秒数。
+   *
+   * 三条约束：
+   * - 只在**第一次**滑到这条时生效（`resumedRef`），否则用户手动选集会被立刻改回去；
+   * - 已经接近片尾（剩不到 5 秒）就当作看完了，从头放，不然一进来就结束；
+   * - 集数要等详情拿到、确认这一集存在才设，避免设成不存在的集号。
+   */
+  const resumedRef = useRef<Set<number>>(new Set(startEp || startTime ? [videoIds[startIndex]] : []));
+
+  /**
+   * 历史记录快照。
+   *
+   * `history` 每 5 秒就会因为 `addHistory` 变一次；如果直接进依赖数组，
+   * 这个续播 effect 会被反复触发。用 ref 读取「当下最新」的值即可，
+   * 不需要因为历史变化而重新决策（决策只做一次，见 `resumedRef`）。
+   */
+  const historyRef = useRef(history);
+  historyRef.current = history;
+
+  useEffect(() => {
+    if (!curId || kind === "post") return;
+    if (resumedRef.current.has(curId)) return;
+
+    const rec = historyRef.current.find((h) => h.id === curId);
+    if (!rec) {
+      resumedRef.current.add(curId);
+      return;
+    }
+
+    // 进度条已经接近结尾：当作看完了，按默认从头播
+    const finished = rec.dur > 0 && rec.t > 0 && rec.t >= rec.dur - 5;
+    let targetEp = 1;
+
+    if (!finished) {
+      targetEp = rec.ep > 0 ? rec.ep : 1;
+      if (targetEp > 1) {
+        // 等详情确认该集存在；详情未到时先不动，detail 变化会再跑一次
+        if (!detail) return;
+        const exists = (detail.episodes || []).some((e) => e.ep_num === targetEp);
+        if (!exists) {
+          resumedRef.current.add(curId);
+          return;
+        }
+        setEpMap((m) => (m[curId] === targetEp ? m : { ...m, [curId]: targetEp }));
+      }
+      if (rec.t > 1) {
+        // 秒数按「真正要播的那一集」登记，否则 key 对不上就不会 seek
+        resumeRef.current = { key: `${curId}:${targetEp}`, t: rec.t };
+      }
+    }
+    resumedRef.current.add(curId);
+    // 详情到齐后再跑一次，处理「首次进来 detail 还是 undefined」的情况
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curId, detail, kind]);
 
   /* 吃瓜帖子：直接拿帖子详情（含 video_url） */
   useEffect(() => {
@@ -482,21 +541,32 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     } catch { toast("画中画开启失败", "info"); }
   };
 
-  const requireLogin = () => { if (!user) { setLoginOpen(true); return false; } return true; };
-
+  /**
+   * 点赞 / 收藏 / 关注一律先落本地，**不要求登录**。
+   *
+   * 游客态下这些操作本来就存在 localStorage 里，界面立刻有反馈；
+   * 登录了才顺手把同一动作同步到服务端。同步失败只影响云端记录，
+   * 不该把已经生效的本地状态回滚，也不该弹登录框挡住播放。
+   */
   const onLike = () => {
     if (!curId) return;
     const on = toggleLikeLocal(curId);
     setHeartBurst((n) => n + 1);
     toast(on ? "已加入喜欢" : "已取消喜欢", on ? "heart" : "info");
-    if (requireLogin()) { if (kind === "post") api.postLike(curId, on).catch(() => {}); else api.like(curId, curEp, on).catch(() => {}); }
+    if (user) {
+      if (kind === "post") api.postLike(curId, on).catch(() => {});
+      else api.like(curId, curEp, on).catch(() => {});
+    }
   };
 
   const onFav = () => {
     if (!curId) return;
     const on = toggleFavLocal(curId);
     toast(on ? "已收藏" : "已取消收藏", on ? "star" : "info");
-    if (requireLogin()) { if (kind === "post") api.postCollect(curId, on).catch(() => {}); else api.collect(curId, on).catch(() => {}); }
+    if (user) {
+      if (kind === "post") api.postCollect(curId, on).catch(() => {});
+      else api.collect(curId, on).catch(() => {});
+    }
   };
 
   const onFollow = () => {
@@ -504,7 +574,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (!uid) return;
     const on = toggleFollowLocal(uid);
     toast(on ? `已关注 ${detail?.author?.name}` : "已取消关注", on ? "ok" : "info");
-    if (requireLogin()) api.follow(uid, on).catch(() => {});
+    if (user) api.follow(uid, on).catch(() => {});
   };
 
   const pickEp = (ep: number) => {

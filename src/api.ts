@@ -21,8 +21,11 @@ export const isMobile = isAndroid || isIos;
 /** 自定义协议地址随平台不同（见 tauri `register_asynchronous_uri_scheme_protocol` 文档）：
  *  Windows / Android → `http://<scheme>.localhost`
  *  macOS / iOS / Linux → `<scheme>://localhost`
- *  Rust 侧 `src-tauri/src/lib.rs` 里改写 m3u8 用的 scheme 必须与此一致。 */
-export const LOCAL = isMacos || isIos ? "hg://localhost" : "http://hg.localhost";
+ *  Rust 侧 `src-tauri/src/lib.rs` 里改写 m3u8 用的 scheme 必须与此一致。
+ *  纯浏览器构建（右侧栏实时预览）没有自定义协议，改走 dev server 的 `/hg/*` 中间件。 */
+const isWebBuild = typeof window !== "undefined" && "__HGHUB_WEB__" in window;
+
+export const LOCAL = isWebBuild ? "/hg" : isMacos || isIos ? "hg://localhost" : "http://hg.localhost";
 
 /** src 是否已是本地协议地址（避免在详情页把代理地址再包一层） */
 export const isLocalMedia = (src: string) => src.startsWith(`${LOCAL}/`);
@@ -131,7 +134,7 @@ export type UpdateInfo = {
 export type LineItem = { name?: string; url: string; host?: string };
 export type LineState = { base: string; default: string; fixed: LineItem[] };
 export type LineMirrors = { source: string; script?: string; items: LineItem[] };
-export type LineProbe = { url: string; ok: boolean; status?: number; ms: number; error?: string };
+export type LineProbe = { url: string; ok: boolean; status?: number; ms: number; error?: string; redirect_to?: string };
 
 /** `https://a.b/c` → `a.b`（线路展示用） */
 export const hostOf = (url: string) => {

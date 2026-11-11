@@ -88,6 +88,19 @@ fn is_internal_webview_host(name: &str) -> bool {
     )
 }
 
+/// 这条 IP 是否明显「不可路由」到公共网络。
+///
+/// `0.0.0.0` / `::` 单独判断：它们不是「内网地址」，而是运营商或 DNS 给出黑洞应答时
+/// 常见的占位（域名停服后权威 DNS 常回 `0.0.0.0`）。把它算进「私网/保留」会让整条
+/// 解析结果被拒绝，症状是用户看到「禁止访问普通内网、回环或保留地址」——
+/// 明明目标是公网域名，却因为 DNS 里混进一条 `0.0.0.0` 全盘不通。
+pub fn is_blackhole(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
 pub fn allowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -176,8 +189,14 @@ pub fn check_addresses_with_mode(addrs: &[SocketAddr], strict: bool) -> Result<(
         return Err("目标没有可用的 DNS 地址".into());
     }
     if strict {
+        // 黑洞应答（0.0.0.0 / ::）不是「内网」，它只是这条答案不可用：
+        // 跳过它，只要还剩一个可用公网地址就放行。全部都是黑洞才报错。
+        let usable: Vec<&SocketAddr> = addrs.iter().filter(|a| !is_blackhole(a.ip())).collect();
+        if usable.is_empty() {
+            return Err("DNS 未返回可用地址（域名可能已停服）".into());
+        }
         // 混合公私网答案整体拒绝，不能让连接器回退到私网地址。
-        for addr in addrs {
+        for addr in usable {
             check_ip(addr.ip())?;
         }
     }
@@ -191,23 +210,127 @@ fn sort_ipv6_first(addrs: &mut [SocketAddr]) {
     addrs.sort_unstable_by_key(|addr| (addr.is_ipv4(), *addr));
 }
 
+/// 系统 DNS 拿不到可用地址时的 DoH 兜底。
+///
+/// 2026-11-11 事故：站点域名在部分网络下被本地 DNS 污染成 `0.0.0.0`
+/// （权威 DNS 仍是正常的 43.x/103.x），客户端因此全部报
+/// 「禁止访问普通内网、回环或保留地址」。这里直接用 DoH 把真地址拿回来，
+/// 绕开被污染的本地递归服务器。
+///
+/// 只用国内可直连、且证书覆盖其 IP 的 DoH 端点，避免为了修 DNS 反而引入新的不可达依赖。
+const DOH_ENDPOINTS: [&str; 2] = [
+    "https://223.5.5.5/resolve",  // 阿里 DNS（JSON API）
+    "https://doh.pub/dns-query",  // DNSPod
+];
+
+/// DoH 返回的 JSON（阿里 `/resolve` 与 DNSPod `/dns-query` 结构一致）。
+fn parse_doh_answer(body: &str) -> Vec<IpAddr> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(answers) = v.get("Answer").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    answers
+        .iter()
+        .filter(|a| {
+            // type 1 = A，type 28 = AAAA
+            matches!(a.get("type").and_then(Value::as_u64), Some(1) | Some(28))
+        })
+        .filter_map(|a| a.get("data").and_then(Value::as_str))
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect()
+}
+
+/// 用 DoH 解析主机名。返回的地址仍要过 [`allowed_ip`]，不因为来源可信就跳过检查。
+async fn resolve_via_doh(host: &str, port: u16) -> Vec<SocketAddr> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .connect_timeout(Duration::from_secs(4))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for base in DOH_ENDPOINTS {
+        for qtype in ["A", "AAAA"] {
+            let url = format!("{base}?name={host}&type={qtype}");
+            let Ok(resp) = client
+                .get(&url)
+                .header("Accept", "application/dns-json")
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(text) = resp.text().await else { continue };
+            for ip in parse_doh_answer(&text) {
+                if allowed_ip(ip) {
+                    out.push(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
 pub async fn resolve_target(url: &Url, strict: bool) -> Result<Vec<SocketAddr>, String> {
     let port = url.port_or_known_default().ok_or("目标端口无效")?;
-    let mut addrs = match url.host().ok_or("目标缺少主机名")? {
-        Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
-        Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
-        Host::Domain(host) => tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .map_err(|_| "DNS 解析超时")?
-        .map_err(|_| "DNS 解析失败")?
-        .collect(),
-    };
+    let host_kind = url.host().ok_or("目标缺少主机名")?;
+
+    // 系统解析失败（或超时）时不能直接放弃：被污染的本地 DNS 会返回一组根服务器地址，
+    // 交给连接器只会得到莫名其妙的失败。先记下来，后面用 DoH 兜底。
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    let mut system_failed = false;
+    match host_kind {
+        Host::Ipv4(ip) => addrs.push(SocketAddr::new(ip.into(), port)),
+        Host::Ipv6(ip) => addrs.push(SocketAddr::new(ip.into(), port)),
+        Host::Domain(host) => {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::net::lookup_host((host, port)),
+            )
+            .await
+            {
+                Ok(Ok(iter)) => addrs = iter.collect(),
+                _ => system_failed = true,
+            }
+        }
+    }
     sort_ipv6_first(&mut addrs);
     addrs.dedup();
+
+    // 系统解析里没有一条可路由的公网地址（失败、被污染成 0.0.0.0、或全被策略拒绝）时，
+    // 用 DoH 重解析一次；拿到就用它，拿不到再按原结果报错。
+    let system_usable: Vec<&SocketAddr> = addrs
+        .iter()
+        .filter(|a| !is_blackhole(a.ip()) && allowed_ip(a.ip()))
+        .collect();
+    if system_usable.is_empty() {
+        if let Host::Domain(host) = host_kind {
+            let mut doh = resolve_via_doh(host, port).await;
+            if !doh.is_empty() {
+                sort_ipv6_first(&mut doh);
+                doh.dedup();
+                return Ok(doh);
+            }
+        }
+        if system_failed {
+            return Err("DNS 解析失败".into());
+        }
+    }
+
     check_addresses_with_mode(&addrs, strict)?;
+    // 黑洞地址留着会把连接器引向 0.0.0.0（连不通且要等超时），直接从待连列表剔掉。
+    addrs.retain(|a| !is_blackhole(a.ip()));
+    if addrs.is_empty() {
+        return Err("DNS 未返回可用地址（域名可能已停服）".into());
+    }
     Ok(addrs)
 }
 
@@ -231,6 +354,42 @@ pub fn redirect_target_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doh_answer_parsing_keeps_only_a_and_aaaa() {
+        // 阿里 /resolve 与 DNSPod /dns-query 都用这套结构
+        let body = r#"{
+            "Status": 0,
+            "Answer": [
+                {"name": "huangguoai.io.", "TTL": 300, "type": 1, "data": "43.230.144.237"},
+                {"name": "huangguoai.io.", "TTL": 300, "type": 1, "data": "103.41.185.240"},
+                {"name": "huangguoai.io.", "TTL": 300, "type": 5, "data": "alias.example."},
+                {"name": "huangguoai.io.", "TTL": 300, "type": 28, "data": "2606:4700::1"}
+            ]
+        }"#;
+        let ips = parse_doh_answer(body);
+        assert_eq!(ips.len(), 3, "CNAME 应被过滤：{ips:?}");
+        assert!(ips.iter().any(|i| i.to_string() == "43.230.144.237"));
+        assert!(ips.iter().any(|i| i.to_string() == "2606:4700::1"));
+
+        // 异常输入不 panic
+        assert!(parse_doh_answer("not json").is_empty());
+        assert!(parse_doh_answer(r#"{"Status":3}"#).is_empty());
+        assert!(parse_doh_answer(r#"{"Answer":[{"type":1,"data":"bad-ip"}]}"#).is_empty());
+    }
+
+    /// 手跑：`cargo test --lib -- --ignored network_policy::tests::doh_live -- --nocapture`
+    /// 验证本地 DNS 被污染时（把域名解析成 127.0.0.1 / 0.0.0.0），DoH 仍能拿回真地址。
+    #[tokio::test]
+    #[ignore = "联网测试：请求公共 DoH 端点"]
+    async fn doh_live() {
+        let addrs = resolve_via_doh("huangguoai.io", 443).await;
+        assert!(!addrs.is_empty(), "DoH 没拿到地址");
+        for a in &addrs {
+            assert!(allowed_ip(a.ip()), "DoH 结果必须过策略：{a}");
+            assert!(!a.ip().is_loopback(), "不能是回环：{a}");
+        }
+    }
 
     #[test]
     fn failed_security_save_keeps_the_effective_mode() {
@@ -348,6 +507,36 @@ mod tests {
             assert!(parse_target(raw).is_err(), "{raw}");
         }
         assert!(parse_target("http://198.18.0.1/video").is_ok());
+    }
+
+    #[test]
+    fn blackhole_dns_answers_are_skipped_instead_of_failing_the_whole_target() {
+        // 2026-11-11 事故复现：站点域名停服后权威 DNS 混入一条 0.0.0.0，
+        // 之前它被当成「保留地址」，整条解析结果被拒，用户看到
+        // 「禁止访问普通内网、回环或保留地址」，明明目标是公网域名。
+        let addrs = [
+            "0.0.0.0:443".parse().unwrap(),
+            "43.230.144.237:443".parse().unwrap(),
+            "103.41.185.240:443".parse().unwrap(),
+        ];
+        assert!(check_addresses(&addrs).is_ok(), "黑洞地址应被跳过，其余公网地址放行");
+
+        // 全是黑洞才报错，且错误文案要说清是「没有可用地址」而不是「内网禁止」
+        let only_blackhole = ["0.0.0.0:443".parse().unwrap()];
+        let err = check_addresses(&only_blackhole).unwrap_err();
+        assert!(err.contains("可用地址"), "{err}");
+
+        // 黑洞与私网混合仍要拒绝：跳过黑洞不能顺带放过真正的内网地址
+        let mixed = [
+            "0.0.0.0:443".parse().unwrap(),
+            "192.168.1.1:443".parse().unwrap(),
+        ];
+        assert!(check_addresses(&mixed).is_err());
+
+        assert!(is_blackhole("0.0.0.0".parse().unwrap()));
+        assert!(is_blackhole("::".parse().unwrap()));
+        assert!(!is_blackhole("1.1.1.1".parse().unwrap()));
+        assert!(!is_blackhole("192.168.1.1".parse().unwrap()));
     }
 
     #[test]

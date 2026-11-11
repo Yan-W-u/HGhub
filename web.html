@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#1a1a1a" />
+    <title>HGhub · 黄果短剧（Web 预览）</title>
+    <script>
+      try {
+        if (localStorage.getItem("hghub_theme") === "light") document.documentElement.classList.add("theme-light");
+      } catch (e) {}
+    </script>
+    <style>html,body{background:#1a1a1a}html.theme-light,html.theme-light body{background:#f3f3f3}</style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.web.tsx"></script>
+  </body>
+</html>

@@ -8,16 +8,24 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 /// 固定线路：写死在客户端里，不依赖任何外部页面。
-pub const FIXED: [(&str, &str); 2] = [
-    ("固定线路 1", "https://huangguoai.com"),
-    ("固定线路 2", "https://huangguoai.ai"),
+///
+/// 2026-11 起 `huangguoai.com` 与 `huangguoai.ai` 都不再提供加密接口
+/// （`.com` 直接连不上，`.ai` 对 `/api/*/request` 返回 nginx 404），
+/// 站点当前在 `huangguoai.io` 提供服务，所以把它放在第一位。
+pub const FIXED: [(&str, &str); 3] = [
+    ("固定线路 1", "https://huangguoai.io"),
+    ("固定线路 2", "https://huangguoai.com"),
+    ("固定线路 3", "https://huangguoai.ai"),
 ];
 
 const PUBLISH_PAGE: &str = "https://huangguoai.pages.dev/";
 /// 镜像列表上限（子域 × 域名是笛卡尔积，界面只展示这么多）
 const MIRROR_MAX: usize = 60;
-/// 单条线路探测超时
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 单条线路探测超时。
+///
+/// 站点页面本身 150 KB 左右，境外 CDN 回国内链路波动大，8 秒会把「能通但慢」误判成
+/// 不可用，用户就会以为线路全挂了。留 15 秒。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn fixed() -> Value {
     json!(FIXED
@@ -69,8 +77,7 @@ pub async fn mirrors() -> Result<Value, String> {
 }
 
 /// 可达性探测（并发 6 条一组）。只报结果，不做自动切换。
-pub async fn probe(urls: Vec<String>) -> Value {
-    let mut out: Vec<Value> = Vec::new();
+pub async fn probe(urls: Vec<String>) -> Value {    let mut out: Vec<Value> = Vec::new();
     for chunk in urls.chunks(6) {
         let mut handles = Vec::new();
         for u in chunk {
@@ -89,19 +96,11 @@ pub async fn probe(urls: Vec<String>) -> Value {
 async fn probe_one(url: String) -> Value {
     let target = format!("{}/", url.trim_end_matches('/'));
     let started = Instant::now();
-    let res = crate::net::get(
-        &target,
-        PROBE_TIMEOUT,
-        Some("text/html,application/xhtml+xml"),
-        None,
-    )
-    .await;
+    // 只取响应头就算通：线路页动辄 150 KB，整页读完会把「能通但慢」判成不可用。
+    let res = crate::net::head(&target, PROBE_TIMEOUT).await;
     let ms = started.elapsed().as_millis() as u64;
     match res {
-        Ok(r) => {
-            let status = r.status().as_u16();
-            json!({ "url": url, "ok": status < 400, "status": status, "ms": ms })
-        }
+        Ok(status) => json!({ "url": url, "ok": status < 400, "status": status, "ms": ms }),
         Err(e) => json!({ "url": url, "ok": false, "ms": ms, "error": e }),
     }
 }

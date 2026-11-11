@@ -19,6 +19,9 @@ function Row({ item, current, probe, busy, disabled, onPick, onProbe }: {
           {current && <ICheck size={13} className="text-mint shrink-0" />}
         </div>
         <div className="text-[10.5px] text-mut truncate mt-0.5">{item.url}</div>
+        {probe?.redirect_to && (
+          <div className="text-[10px] text-primary truncate mt-0.5">跳转至 {hostOf(probe.redirect_to)}（切换后自动采用）</div>
+        )}
       </button>
       <span
         title={probe ? (probe.error || (probe.status ? `HTTP ${probe.status}` : "")) : ""}

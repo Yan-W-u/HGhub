@@ -96,6 +96,19 @@ function AppBody() {
     return () => ro.disconnect();
   }, []);
 
+  /* 窄视口（右侧栏预览 / 分屏）自动收起左侧 rail：
+     否则 128px 的导航栏会把内容挤到只剩一条，封面与视频都放不出来。 */
+  useEffect(() => {
+    if (isMobile) return;
+    const el = mainRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth < 560) setCollapsed(true);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   /* 全局键盘 */
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {

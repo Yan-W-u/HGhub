@@ -142,8 +142,8 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
 
       <form className="shrink-0 flex items-center gap-2 px-3 py-2.5 bg-s2/70" onSubmit={(e) => { e.preventDefault(); send(); }}>
         <Avatar size={30} name={user?.nickname || "我"} hue={322} />
+        {/* 不在 onFocus 就弹登录：游客先把字打完，点发送时才提示，少一次打断 */}
         <input ref={inputRef} value={text} onChange={(e) => setText(e.target.value)}
-          onFocus={() => { if (!user) setLoginOpen(true); }}
           placeholder={user ? "说点什么…" : "登录后参与评论"}
           className="flex-1 min-w-0 h-9 rounded-(--r-ctl) bg-s4 px-3.5 text-[12.5px] text-on placeholder-dim outline-none focus:bg-s3" />
         <button type="submit" disabled={!text.trim() || sending}
